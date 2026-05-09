@@ -275,6 +275,7 @@
                   <th>Val</th>
                   <th>Test</th>
                   <th>Total</th>
+                  <th>Videos</th>
                   <th>Purpose</th>
                 </tr>
               </thead>
@@ -285,7 +286,8 @@
                   <td>465</td>
                   <td>1,036</td>
                   <td>5,639</td>
-                  <td>Benchmark split for main experiments</td>
+                  <td>1,957</td>
+                  <td>Benchmark split used for evaluation</td>
                 </tr>
                 <tr>
                   <td>Full</td>
@@ -293,6 +295,7 @@
                   <td>2,235</td>
                   <td>2,986</td>
                   <td>22,119</td>
+                  <td>5,468</td>
                   <td>Complete dataset for scaling studies</td>
                 </tr>
               </tbody>
@@ -437,6 +440,47 @@
               <span class="micro-label">Toolkit</span>
               <strong>Official JSONL evaluation scripts are released in the GitHub repository</strong>
             </div>
+          </div>
+          <div class="formula-grid reveal-on-scroll">
+            <article class="formula-card">
+              <div class="formula-tag">Null-set Rejection</div>
+              <h3>Rej-F1</h3>
+              <p>
+                Treats correctly rejected null-set queries as the target class at an operating
+                threshold tau.
+              </p>
+              <div class="formula-block">
+                Rej-F1 = 2TP<sub>r</sub> / (2TP<sub>r</sub> + FP<sub>r</sub> + FN<sub>r</sub>)
+              </div>
+            </article>
+            <article class="formula-card">
+              <div class="formula-tag">Multi-moment Retrieval</div>
+              <h3>mR+@k</h3>
+              <p>
+                Measures the retrieval of additional relevant moments beyond the first matched
+                moment on multi-moment queries.
+              </p>
+              <div class="formula-block">
+                mR+@k = 1/|I| sum<sub>theta in I</sub> 1/|Q<sup>m</sup>| sum<sub>q in Q<sup>m</sup></sub>
+                max(0, |M<sub>k</sub>(q;theta)| - 1) / (|G(q)| - 1)
+              </div>
+            </article>
+            <article class="formula-card">
+              <div class="formula-tag">End-to-End GMR</div>
+              <h3>G-mIoU@k</h3>
+              <p>
+                Jointly evaluates rejection and localization over all queries after gating
+                predictions by the existence score.
+              </p>
+              <div class="formula-block">
+                G-mIoU@k = 1/|Q| sum<sub>q in Q</sub> IoU<sub>G</sub>(q)
+              </div>
+              <div class="formula-cases">
+                IoU<sub>G</sub>(q) = 1 for correct empty-set rejection; 0 for positive/null-set
+                mismatch; otherwise set-level IoU between top-k predictions and all ground-truth
+                moments.
+              </div>
+            </article>
           </div>
         </section>
 

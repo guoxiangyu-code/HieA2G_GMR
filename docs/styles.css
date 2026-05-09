@@ -277,6 +277,7 @@ button {
 .image-panel,
 .feature-card,
 .metric-card,
+.formula-card,
 .resource-card,
 .table-card,
 .demo-shell,
@@ -485,6 +486,7 @@ button {
 
 .two-column-grid,
 .metric-columns,
+.formula-grid,
 .scenario-grid,
 .resource-grid,
 .stats-grid,
@@ -520,6 +522,7 @@ button {
 }
 
 .metric-columns,
+.formula-grid,
 .scenario-grid,
 .resource-grid,
 .stats-grid {
@@ -528,6 +531,7 @@ button {
 
 .feature-card,
 .metric-card,
+.formula-card,
 .resource-card,
 .table-card,
 .code-card,
@@ -573,6 +577,7 @@ button {
 
 .feature-card h3,
 .metric-card h3,
+.formula-card h3,
 .resource-card h3,
 .scenario-card h3,
 .comparison-card h3,
@@ -607,6 +612,59 @@ button {
 .metric-card li,
 .comparison-card li {
   margin: 10px 0;
+}
+
+.formula-grid {
+  margin-top: 22px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.formula-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 280px;
+}
+
+.formula-card p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.65;
+}
+
+.formula-tag {
+  width: fit-content;
+  padding: 6px 10px;
+  border-radius: 999px;
+  color: var(--accent);
+  background: rgba(57, 209, 173, 0.1);
+  border: 1px solid rgba(57, 209, 173, 0.18);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.formula-block,
+.formula-cases {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(4, 12, 21, 0.36);
+  border-radius: 16px;
+  color: #ddecff;
+  font-family: "IBM Plex Sans", sans-serif;
+  line-height: 1.7;
+}
+
+.formula-block {
+  padding: 14px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.formula-cases {
+  padding: 12px 14px;
+  color: var(--muted);
+  font-size: 0.9rem;
 }
 
 .scenario-section .image-panel,
@@ -960,6 +1018,7 @@ td {
   }
 
   .metric-columns,
+  .formula-grid,
   .scenario-grid,
   .resource-grid,
   .stats-grid {
@@ -978,6 +1037,7 @@ td {
   }
 
   .metric-columns,
+  .formula-grid,
   .scenario-grid,
   .resource-grid,
   .stats-grid,
