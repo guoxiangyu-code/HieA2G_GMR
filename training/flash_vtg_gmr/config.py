@@ -174,6 +174,8 @@ class BaseOptions(object):
                             help="Weight for existence BCE loss.")
         parser.add_argument("--exist_gate_thd", type=float, default=0.5,
                             help="Soft gate threshold used in inference; if p_exist<thd, score*=p_exist.")
+        parser.add_argument("--null_anchor_coef", type=float, default=0.3,
+                            help="Weight for null anchor loss.")
         parser.add_argument("--pred_topk_for_cls", type=int, default=10,
                             help="Top-K windows used for GMR positive/negative classification metrics.")
         parser.add_argument("--pred_score_thd_for_cls", type=float, default=0.5,

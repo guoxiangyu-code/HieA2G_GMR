@@ -669,8 +669,9 @@ class SetCriterion(nn.Module):
             loss_null_anchor = torch.tensor(0.0, device=logits.device)
 
         # Total AMC loss
-        # Weight config: Focal = 1.0, Soft = 0.3, Ordinal = 0.5, NullAnchor = 1.0
-        loss_total = loss_focal * 1.0 + loss_soft * 0.3 + (loss_ord + loss_ord_penalty) * 0.5 + loss_null_anchor * 1.0
+        # Weight config: Focal = 1.0, Soft = 0.3, Ordinal = 0.5, NullAnchor = self.args.null_anchor_coef
+        null_coef = float(getattr(self.args, "null_anchor_coef", 0.3))
+        loss_total = loss_focal * 1.0 + loss_soft * 0.3 + (loss_ord + loss_ord_penalty) * 0.5 + loss_null_anchor * null_coef
 
         return {
             "loss_exist": loss_total,
@@ -1046,6 +1047,26 @@ class SetCriterion(nn.Module):
 
         return {"loss_global": (loss_t2v + loss_v2t) / 2}
 
+    def loss_count_window_consistency(self, outputs, targets, log=True):
+        if "out_class" not in outputs or "pred_exist_logits" not in outputs:
+            return {"loss_consistency": torch.tensor(0.0, device=self.device)}
+        
+        window_scores = outputs["out_class"].sigmoid()
+        if window_scores.dim() == 3:
+            window_scores = window_scores[:, :, 0] # (B, N)
+        
+        count_probs = F.softmax(outputs["pred_exist_logits"], dim=-1)  # (B, 5)
+        
+        # Expectation
+        classes = torch.arange(5, device=count_probs.device).float()
+        expected_count = (count_probs * classes).sum(dim=-1)  # (B,)
+        
+        # Window head's signal strength = top-3 window scores mean
+        top3_mean = window_scores.topk(3, dim=-1).values.mean(dim=-1)  # (B,)
+        
+        loss = F.mse_loss(expected_count, top3_mean * 4.0)
+        return {"loss_consistency": loss}
+
     def get_loss(self, loss, outputs, targets, **kwargs):
         loss_map = {
             "labels": self.loss_labels,
@@ -1054,6 +1075,7 @@ class SetCriterion(nn.Module):
             "mask_rec": self.loss_mask_rec,
             "phrase": self.loss_phrase_moment,
             "global": self.loss_global_align,
+            "consistency": self.loss_count_window_consistency,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
 
@@ -1285,7 +1307,8 @@ def build_model1(args):
         weight_dict["loss_mask_rec"] = 0.5
         weight_dict["loss_phrase"] = 0.3
         weight_dict["loss_global"] = 0.2
-        losses = list(losses) + ["exist", "mask_rec", "phrase", "global"]
+        weight_dict["loss_consistency"] = 0.2
+        losses = list(losses) + ["exist", "mask_rec", "phrase", "global", "consistency"]
 
     criterion = SetCriterion(
         weight_dict=weight_dict, losses=losses,
