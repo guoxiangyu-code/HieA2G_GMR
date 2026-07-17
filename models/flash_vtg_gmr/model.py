@@ -305,8 +305,8 @@ class FlashVTG(nn.Module):
 
             out_class = [self.class_head(e.float()) for e in pymid]
             out_class = torch.cat(out_class, dim=1)
-            out_conf = torch.cat(pymid, dim=1)
-            out_conf = self.conf_head(out_conf)
+            out_features = torch.cat(pymid, dim=1)
+            out_conf = self.conf_head(out_features)
             out_class = self.x*out_class+(1-self.x)*out_conf
 
             if self.coord_head is not None:
@@ -508,14 +508,25 @@ class SetCriterion(nn.Module):
         # 2. Soft Label Loss
         loss_soft = -(soft_labels * log_probs).sum(dim=-1).mean()
 
+        # 3. Ordered Regression Loss (A2: penalizing jump errors)
+        classes = torch.arange(5, device=logits.device).float()
+        expected = (probs * classes).sum(dim=-1)
+        loss_ord = F.mse_loss(expected, labels.float())
+        
+        loss_ord_penalty = torch.tensor(0.0, device=logits.device)
+        for c_prime in range(5):
+            loss_ord_penalty = loss_ord_penalty + (torch.abs(c_prime - labels.float()) * (probs[:, c_prime] ** 2.0)).mean()
+
         # Total AMC loss
-        # Weight config: Focal = 1.0, Soft = 0.3
-        loss_total = loss_focal * 1.0 + loss_soft * 0.3
+        # Weight config: Focal = 1.0, Soft = 0.3, Ordinal = 0.5
+        loss_total = loss_focal * 1.0 + loss_soft * 0.3 + (loss_ord + loss_ord_penalty) * 0.5
 
         return {
             "loss_exist": loss_total,
             "loss_exist_focal": loss_focal,
-            "loss_exist_soft": loss_soft
+            "loss_exist_soft": loss_soft,
+            "loss_exist_ord": loss_ord,
+            "loss_exist_ord_penalty": loss_ord_penalty
         }
 
     def loss_saliency(self, outputs, targets, log=True):
