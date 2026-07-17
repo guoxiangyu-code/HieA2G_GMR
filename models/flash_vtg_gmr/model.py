@@ -523,16 +523,26 @@ class SetCriterion(nn.Module):
             loss_ord = torch.tensor(0.0, device=logits.device)
             loss_ord_penalty = torch.tensor(0.0, device=logits.device)
 
+        # 4. Null Anchor Loss (preventing leakage of empty-set samples to classes >= 2)
+        null_mask = (labels == 0)
+        if null_mask.any():
+            p0 = probs[null_mask, 0]
+            p2plus = probs[null_mask, 2:].sum(dim=-1)
+            loss_null_anchor = F.relu(p2plus - p0 + 0.3).mean()
+        else:
+            loss_null_anchor = torch.tensor(0.0, device=logits.device)
+
         # Total AMC loss
-        # Weight config: Focal = 1.0, Soft = 0.3, Ordinal = 0.5
-        loss_total = loss_focal * 1.0 + loss_soft * 0.3 + (loss_ord + loss_ord_penalty) * 0.5
+        # Weight config: Focal = 1.0, Soft = 0.3, Ordinal = 0.5, NullAnchor = 1.0
+        loss_total = loss_focal * 1.0 + loss_soft * 0.3 + (loss_ord + loss_ord_penalty) * 0.5 + loss_null_anchor * 1.0
 
         return {
             "loss_exist": loss_total,
             "loss_exist_focal": loss_focal,
             "loss_exist_soft": loss_soft,
             "loss_exist_ord": loss_ord,
-            "loss_exist_ord_penalty": loss_ord_penalty
+            "loss_exist_ord_penalty": loss_ord_penalty,
+            "loss_exist_null_anchor": loss_null_anchor
         }
 
     def loss_saliency(self, outputs, targets, log=True):
