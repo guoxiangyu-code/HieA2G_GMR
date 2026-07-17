@@ -142,6 +142,10 @@ class StartEndDataset(Dataset):
                 (self.vocab.vectors, torch.zeros(1, self.vocab.dim)), dim=0)
             self.embedding = nn.Embedding.from_pretrained(self.vocab.vectors)
 
+        # Initialize tokenizer online
+        from transformers import AutoTokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained('openai/clip-vit-base-patch32')
+
         # Load all data into memory
         self._preload_data()
 
@@ -262,6 +266,75 @@ class StartEndDataset(Dataset):
                 model_inputs["count_soft"] = soft
 
                 model_inputs["span_labels"] = self.get_span_labels(windows, ctx_l)  # (#windows, 2) or (0,2)
+
+                # --- HTMA ONLINE PREPROCESSING ---
+                query_text = meta.get("query", "")
+                if query_text:
+                    tokens = self.tokenizer(query_text, max_length=self.max_q_l, truncation=True)["input_ids"]
+                    pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 49407
+                    tokens_padded = tokens + [pad_id] * (self.max_q_l - len(tokens))
+                    model_inputs["tokens"] = torch.tensor(tokens_padded, dtype=torch.long)
+                    
+                    ACTION_WORDS = {"saves", "scores", "passes", "dribbles", "blocks",
+                                    "tackles", "shoots", "crosses", "clears", "fouls",
+                                    "header", "volley", "tackle", "intercept", "shot", "foul", "clearance"}
+                    mask_positions = []
+                    masked_word_ids = []
+                    for i, t in enumerate(tokens):
+                        if t in [self.tokenizer.bos_token_id, self.tokenizer.eos_token_id, pad_id]:
+                            continue
+                        word = self.tokenizer.decode([t]).strip().lower()
+                        if word in ACTION_WORDS and random.random() < 0.15:
+                            mask_positions.append(i)
+                            masked_word_ids.append(t)
+                    
+                    if not mask_positions:
+                        candidates = [i for i, t in enumerate(tokens) 
+                                      if t not in [self.tokenizer.bos_token_id, self.tokenizer.eos_token_id, pad_id]]
+                        if candidates:
+                            pos = random.choice(candidates)
+                            mask_positions.append(pos)
+                            masked_word_ids.append(tokens[pos])
+                    
+                    max_masks = 5
+                    padded_mask_positions = mask_positions[:max_masks] + [-1] * (max_masks - len(mask_positions))
+                    padded_masked_word_ids = masked_word_ids[:max_masks] + [-1] * (max_masks - len(masked_word_ids))
+                    
+                    model_inputs["mask_positions"] = torch.tensor(padded_mask_positions, dtype=torch.long)
+                    model_inputs["masked_word_ids"] = torch.tensor(padded_masked_word_ids, dtype=torch.long)
+                    
+                    def find_sublist(sub, main):
+                        n, m = len(main), len(sub)
+                        for i in range(n - m + 1):
+                            if main[i : i + m] == sub:
+                                return i, i + m
+                        return 0, 0
+                    
+                    if "players from" in query_text.lower():
+                        idx = query_text.lower().find("players from")
+                        phrase1 = query_text[:idx].strip()
+                        phrase2 = query_text[idx:].strip()
+                    else:
+                        phrase1 = query_text
+                        phrase2 = ""
+                    
+                    phrase_spans = []
+                    for phrase in [phrase1, phrase2]:
+                        if phrase:
+                            p_tokens = self.tokenizer(phrase, add_special_tokens=False)["input_ids"]
+                            start, end = find_sublist(p_tokens, tokens)
+                            phrase_spans.append([start, end])
+                        else:
+                            phrase_spans.append([0, 0])
+                    while len(phrase_spans) < 2:
+                        phrase_spans.append([0, 0])
+                    model_inputs["phrase_spans"] = torch.tensor(phrase_spans, dtype=torch.long)
+                else:
+                    pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 49407
+                    model_inputs["tokens"] = torch.zeros(self.max_q_l, dtype=torch.long)
+                    model_inputs["mask_positions"] = torch.full((5,), -1, dtype=torch.long)
+                    model_inputs["masked_word_ids"] = torch.full((5,), -1, dtype=torch.long)
+                    model_inputs["phrase_spans"] = torch.zeros((2, 2), dtype=torch.long)
 
                 # Build a minimal saliency supervision that is safe for empty windows.
                 # For negative samples, we create all-zero saliency labels.
@@ -641,6 +714,9 @@ def start_end_collate(batch):
         if k == "count_soft":
             batched_data[k] = torch.stack([e[1][k] for e in batch], dim=0)
             continue
+        if k in ["mask_positions", "masked_word_ids", "phrase_spans", "tokens"]:
+            batched_data[k] = torch.stack([e[1][k] for e in batch], dim=0)
+            continue
         if k in ["saliency_pos_labels", "saliency_neg_labels"]:
             batched_data[k] = torch.LongTensor([e[1][k] for e in batch])
             continue
@@ -681,6 +757,13 @@ def prepare_batch_inputs(batched_model_inputs, device, non_blocking=False):
         targets["count_label"] = batched_model_inputs["count_label"].to(device, non_blocking=non_blocking)
     if "count_soft" in batched_model_inputs:
         targets["count_soft"] = batched_model_inputs["count_soft"].to(device, non_blocking=non_blocking)
+    
+    if "mask_positions" in batched_model_inputs:
+        model_inputs["mask_positions"] = batched_model_inputs["mask_positions"].to(device, non_blocking=non_blocking)
+    if "phrase_spans" in batched_model_inputs:
+        model_inputs["phrase_spans"] = batched_model_inputs["phrase_spans"].to(device, non_blocking=non_blocking)
+    if "masked_word_ids" in batched_model_inputs:
+        targets["masked_word_ids"] = batched_model_inputs["masked_word_ids"].to(device, non_blocking=non_blocking)
 
     if "saliency_pos_labels" in batched_model_inputs:
         for name in ["saliency_pos_labels", "saliency_neg_labels"]:

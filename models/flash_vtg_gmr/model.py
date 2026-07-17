@@ -167,6 +167,83 @@ class AdaptiveMomentCounter(nn.Module):
         
         return count_logits
 
+def sinusoidal_pe(start, end, D, device):
+    pe = torch.zeros(D, device=device)
+    half_d = D // 2
+    
+    # For start
+    position_s = float(start)
+    div_term = torch.exp(torch.arange(0, half_d, 2, dtype=torch.float, device=device) * -(9.21034037197 / half_d))
+    pe[0:half_d:2] = torch.sin(position_s * div_term)
+    pe[1:half_d:2] = torch.cos(position_s * div_term)
+    
+    # For end
+    position_e = float(end)
+    pe[half_d::2] = torch.sin(position_e * div_term[:len(pe[half_d::2])])
+    pe[half_d+1::2] = torch.cos(position_e * div_term[:len(pe[half_d+1::2])])
+    
+    return pe
+
+def compute_sinkhorn(cost_matrix, epsilon=0.1, n_iters=3):
+    B, M, N = cost_matrix.shape
+    K = torch.exp(-cost_matrix / epsilon)  # (B, M, N)
+    p = torch.full((B, M), 1.0/M, device=cost_matrix.device)
+    q = torch.full((B, N), 1.0/N, device=cost_matrix.device)
+    u = torch.ones_like(p)
+    v = torch.ones_like(q)
+    for _ in range(n_iters):
+        u = p / (torch.bmm(K, v.unsqueeze(-1)).squeeze(-1) + 1e-8)
+        v = q / (torch.bmm(K.transpose(-1,-2), u.unsqueeze(-1)).squeeze(-1) + 1e-8)
+    T = u.unsqueeze(-1) * K * v.unsqueeze(1)
+    return T
+
+class SinkhornMatcher(nn.Module):
+    """最优传输匹配, 替代二分匹配"""
+    def __init__(self, epsilon=0.1, n_iters=3):
+        super().__init__()
+        self.epsilon = epsilon
+        self.n_iters = n_iters
+
+    def forward(self, cost_matrix):
+        return compute_sinkhorn(cost_matrix, self.epsilon, self.n_iters)
+
+class HTMA(nn.Module):
+    def __init__(self, hidden_dim, vocab_size, num_clips=75):
+        super().__init__()
+        D = hidden_dim
+
+        # === Level 1: 词-帧恢复 ===
+        self.cross_attn_w2f = nn.MultiheadAttention(D, 8, batch_first=True)
+        self.word_recovery_head = nn.Linear(D, vocab_size)
+        self.temporal_pos = nn.Parameter(torch.randn(1, num_clips, D))
+
+        # === Level 2: 短语-片段对齐 ===
+        self.phrase_proj = nn.Linear(D, 128)
+        self.moment_proj = nn.Linear(D, 128)
+
+        # === Level 3: 全局对齐 ===
+        self.text_global_proj = nn.Linear(D, 128)
+        self.video_global_proj = nn.Linear(D, 128)
+
+    def construct_moment_embedding(self, video_feat, proposals):
+        B, N, _ = proposals.shape
+        T = video_feat.size(1)
+        D = video_feat.size(2)
+
+        moment_feats = []
+        for b in range(B):
+            feats = []
+            for n in range(N):
+                s, e = proposals[b, n]
+                s, e = int(s.clamp(0, T-1)), int(e.clamp(0, T))
+                if s >= e:
+                    e = min(s + 1, T)
+                pooled = video_feat[b, s:e].mean(dim=0)
+                pe = sinusoidal_pe(s, e, D, video_feat.device)
+                feats.append(pooled + pe)
+            moment_feats.append(torch.stack(feats))
+        return torch.stack(moment_feats) # (B, N, D)
+
 class FlashVTG(nn.Module):
     """ FlashVTG. """
 
@@ -235,9 +312,13 @@ class FlashVTG(nn.Module):
         self.exist_pool = str(getattr(args, "exist_pool", "mean"))
         if self.use_exist_head:
             self.amc_counter = AdaptiveMomentCounter(hidden_dim)
+            self.htma = HTMA(hidden_dim, vocab_size=49408, num_clips=75)
+            self.txt_mask_embed = nn.Parameter(torch.randn(hidden_dim))
+            self.logit_scale = nn.Parameter(torch.log(torch.tensor(1.0 / 0.07)))
+            self.sinkhorn_matcher = SinkhornMatcher(epsilon=0.1, n_iters=3)
 
 
-    def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, targets=None):
+    def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, targets=None, mask_positions=None, phrase_spans=None, **kwargs):
         if vid is not None:
             _count = [v.count('_') for v in vid]
             # Only QVHighlights video IDs use the conventional "_start_end" suffix.
@@ -348,6 +429,61 @@ class FlashVTG(nn.Module):
                     decoded_proposals
                 )
                 output["pred_exist_logits"] = pred_exist_logits # (B, 5)
+
+                # --- HTMA FORWARD PASS ---
+                B_size, L_size, D_size = src_txt.shape
+                
+                # Level 1: Word-Frame Recovery
+                if self.training and mask_positions is not None:
+                    src_txt_masked = src_txt.clone()
+                    for b in range(B_size):
+                        for pos in mask_positions[b]:
+                            if pos >= 0 and pos < L_size:
+                                src_txt_masked[b, pos] = self.txt_mask_embed
+                else:
+                    src_txt_masked = src_txt
+
+                vid_with_pos = video_emb + self.htma.temporal_pos[:, :video_emb.size(1), :]
+                recovered, _ = self.htma.cross_attn_w2f(query=src_txt_masked, key=vid_with_pos, value=vid_with_pos)
+                word_logits = self.htma.word_recovery_head(recovered) # (B, L, vocab_size)
+                
+                output["word_logits"] = word_logits
+                output["mask_positions"] = mask_positions
+
+                # Level 2: Phrase-Moment Alignment
+                if phrase_spans is not None:
+                    B_size, M_size, _ = phrase_spans.shape
+                    phrase_feats = []
+                    for b in range(B_size):
+                        p_feats = []
+                        for m in range(M_size):
+                            s, e = phrase_spans[b, m]
+                            if s == 0 and e == 0:
+                                p_feats.append(torch.zeros(D_size, device=src_txt.device))
+                            else:
+                                p_feats.append(src_txt[b, s:e].mean(dim=0))
+                        phrase_feats.append(torch.stack(p_feats))
+                    phrase_feats = torch.stack(phrase_feats) # (B, M, D)
+                    
+                    moment_feats = self.htma.construct_moment_embedding(video_emb, decoded_proposals) # (B, N, D)
+                    
+                    p = F.normalize(self.htma.phrase_proj(phrase_feats), dim=-1) # (B, M, 128)
+                    m = F.normalize(self.htma.moment_proj(moment_feats), dim=-1) # (B, N, 128)
+                    phrase_moment_sim = (torch.einsum('bmd,bnd->bmn', p, m) + 1.0) / 2.0 # (B, M, N)
+                    output["phrase_moment_sim"] = phrase_moment_sim
+                else:
+                    output["phrase_moment_sim"] = None
+
+                # Level 3: Global Text-Video Alignment
+                text_global = src_txt.mean(dim=1) # (B, D)
+                video_global = video_emb.mean(dim=1) # (B, D)
+                
+                global_t = F.normalize(self.htma.text_global_proj(text_global), dim=-1) # (B, 128)
+                global_v = F.normalize(self.htma.video_global_proj(video_global), dim=-1) # (B, 128)
+                
+                output["global_t"] = global_t
+                output["global_v"] = global_v
+                # -------------------------
 
             if self.training == True:
 
@@ -842,11 +978,82 @@ class SetCriterion(nn.Module):
             loss_saliency += (loss_saliency_attn * self.args.lw_wattn)
         return {"loss_saliency": loss_saliency}
 
+    def loss_mask_rec(self, outputs, targets, log=True):
+        if "word_logits" not in outputs or "masked_word_ids" not in targets:
+            return {"loss_mask_rec": torch.tensor(0.0, device=self.device)}
+        word_logits = outputs["word_logits"]   # (B, L, V)
+        mask_ids = targets["masked_word_ids"]  # (B, num_masks)
+        
+        B, L, V = word_logits.shape
+        _, num_masks = mask_ids.shape
+        
+        exist_labels = targets.get("exist_label", None)
+        is_null = (exist_labels < 0.5) if exist_labels is not None else None
+        
+        loss_pos_list = []
+        loss_null_list = []
+        
+        mask_positions = outputs.get("mask_positions", None)
+        if mask_positions is None:
+            return {"loss_mask_rec": torch.tensor(0.0, device=self.device)}
+            
+        for b in range(B):
+            for i in range(num_masks):
+                pos = mask_positions[b, i].item()
+                target_id = mask_ids[b, i].item()
+                if pos < 0 or target_id < 0:
+                    continue
+                
+                logit = word_logits[b, pos]
+                
+                if is_null is not None and is_null[b]:
+                    correct_logit = logit[target_id]
+                    mask = torch.ones_like(logit)
+                    mask[target_id] = 0.0
+                    max_other = (logit * mask - (1 - mask) * 1e9).max()
+                    loss_null = F.relu(correct_logit - max_other + 0.5)
+                    loss_null_list.append(loss_null)
+                else:
+                    loss_pos = F.cross_entropy(logit.unsqueeze(0), torch.tensor([target_id], device=logit.device))
+                    loss_pos_list.append(loss_pos)
+                    
+        loss_pos_val = torch.stack(loss_pos_list).mean() if loss_pos_list else torch.tensor(0.0, device=self.device)
+        loss_null_val = torch.stack(loss_null_list).mean() if loss_null_list else torch.tensor(0.0, device=self.device)
+        
+        return {"loss_mask_rec": loss_pos_val + 0.3 * loss_null_val}
+
+    def loss_phrase_moment(self, outputs, targets, log=True):
+        if "phrase_moment_sim" not in outputs or outputs["phrase_moment_sim"] is None:
+            return {"loss_phrase": torch.tensor(0.0, device=self.device)}
+        sim = outputs["phrase_moment_sim"] # (B, M, N)
+        cost = 1.0 - sim
+        T = compute_sinkhorn(cost, epsilon=0.1, n_iters=3)
+        loss = -(T * torch.log(sim + 1e-8)).sum(dim=(-2, -1)).mean()
+        return {"loss_phrase": loss}
+
+    def loss_global_align(self, outputs, targets, log=True):
+        if "global_t" not in outputs or "global_v" not in outputs:
+            return {"loss_global": torch.tensor(0.0, device=self.device)}
+        t = outputs["global_t"]
+        v = outputs["global_v"]
+        
+        logit_scale = torch.exp(getattr(self.args, "logit_scale", torch.tensor(math.log(1.0 / 0.07), device=t.device)))
+        sim = torch.mm(t, v.t()) * logit_scale
+        labels = torch.arange(t.size(0), device=sim.device)
+
+        loss_t2v = F.cross_entropy(sim, labels)
+        loss_v2t = F.cross_entropy(sim.t(), labels)
+
+        return {"loss_global": (loss_t2v + loss_v2t) / 2}
+
     def get_loss(self, loss, outputs, targets, **kwargs):
         loss_map = {
             "labels": self.loss_labels,
             "saliency": self.loss_saliency,
             "exist": self.loss_exist,
+            "mask_rec": self.loss_mask_rec,
+            "phrase": self.loss_phrase_moment,
+            "global": self.loss_global_align,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
 
@@ -1075,7 +1282,10 @@ def build_model1(args):
 
     if bool(getattr(args, "use_exist_head", False)):
         weight_dict["loss_exist"] = float(getattr(args, "exist_loss_coef", 1.0))
-        losses = list(losses) + ["exist"]
+        weight_dict["loss_mask_rec"] = 0.5
+        weight_dict["loss_phrase"] = 0.3
+        weight_dict["loss_global"] = 0.2
+        losses = list(losses) + ["exist", "mask_rec", "phrase", "global"]
 
     criterion = SetCriterion(
         weight_dict=weight_dict, losses=losses,

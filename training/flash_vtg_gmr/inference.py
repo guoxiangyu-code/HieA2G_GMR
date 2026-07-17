@@ -526,9 +526,9 @@ def setup_model(opt):
         criterion.to(opt.device)
 
     if getattr(opt, "train_amc_only", False):
-        logger.info("Freezing all model weights except amc_counter...")
+        logger.info("Freezing all model weights except amc_counter and htma...")
         for name, param in model.named_parameters():
-            if "amc_counter" in name:
+            if any(k in name for k in ["amc_counter", "htma", "txt_mask_embed", "logit_scale"]):
                 param.requires_grad = True
             else:
                 param.requires_grad = False
@@ -541,14 +541,14 @@ def setup_model(opt):
             },
         ]
     else:
-        # Differential learning rates: new amc_counter gets opt.lr, frozen/pretrained backbone gets opt.lr * 0.1
+        # Differential learning rates: new amc_counter/htma gets opt.lr, frozen/pretrained backbone gets opt.lr * 0.1
         param_dicts = [
             {
-                "params": [p for n, p in model.named_parameters() if p.requires_grad and "amc_counter" not in n],
+                "params": [p for n, p in model.named_parameters() if p.requires_grad and not any(k in n for k in ["amc_counter", "htma", "txt_mask_embed", "logit_scale"])],
                 "lr": opt.lr * 0.1,
             },
             {
-                "params": [p for n, p in model.named_parameters() if p.requires_grad and "amc_counter" in n],
+                "params": [p for n, p in model.named_parameters() if p.requires_grad and any(k in n for k in ["amc_counter", "htma", "txt_mask_embed", "logit_scale"])],
                 "lr": opt.lr,
             },
         ]
