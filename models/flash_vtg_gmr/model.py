@@ -509,13 +509,19 @@ class SetCriterion(nn.Module):
         loss_soft = -(soft_labels * log_probs).sum(dim=-1).mean()
 
         # 3. Ordered Regression Loss (A2: penalizing jump errors)
-        classes = torch.arange(5, device=logits.device).float()
-        expected = (probs * classes).sum(dim=-1)
-        loss_ord = F.mse_loss(expected, labels.float())
-        
-        loss_ord_penalty = torch.tensor(0.0, device=logits.device)
-        for c_prime in range(5):
-            loss_ord_penalty = loss_ord_penalty + (torch.abs(c_prime - labels.float()) * (probs[:, c_prime] ** 2.0)).mean()
+        # Apply only to positive samples (labels > 0) to avoid class 0 bias
+        pos_mask = (labels > 0)
+        if pos_mask.any():
+            classes = torch.arange(5, device=logits.device).float()
+            expected = (probs * classes).sum(dim=-1)
+            loss_ord = F.mse_loss(expected[pos_mask], labels[pos_mask].float())
+            
+            loss_ord_penalty = torch.tensor(0.0, device=logits.device)
+            for c_prime in range(5):
+                loss_ord_penalty = loss_ord_penalty + (torch.abs(c_prime - labels[pos_mask].float()) * (probs[pos_mask, c_prime] ** 2.0)).mean()
+        else:
+            loss_ord = torch.tensor(0.0, device=logits.device)
+            loss_ord_penalty = torch.tensor(0.0, device=logits.device)
 
         # Total AMC loss
         # Weight config: Focal = 1.0, Soft = 0.3, Ordinal = 0.5
