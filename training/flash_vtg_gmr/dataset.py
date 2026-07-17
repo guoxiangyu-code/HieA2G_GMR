@@ -251,6 +251,16 @@ class StartEndDataset(Dataset):
                 exist = 1.0 if (isinstance(windows, list) and len(windows) > 0) else 0.0
                 model_inputs["exist_label"] = float(exist)
 
+                num_moments = len(windows)
+                model_inputs["count_label"] = min(num_moments, 4)
+
+                soft = torch.full((5,), 0.0)
+                idx = min(num_moments, 4)
+                soft[idx] = 0.6
+                if idx > 0: soft[idx - 1] = 0.2
+                if idx < 4: soft[idx + 1] = 0.2
+                model_inputs["count_soft"] = soft
+
                 model_inputs["span_labels"] = self.get_span_labels(windows, ctx_l)  # (#windows, 2) or (0,2)
 
                 # Build a minimal saliency supervision that is safe for empty windows.
@@ -625,6 +635,12 @@ def start_end_collate(batch):
         if k == "exist_label":
             batched_data[k] = torch.tensor([e[1][k] for e in batch], dtype=torch.float32)
             continue
+        if k == "count_label":
+            batched_data[k] = torch.tensor([e[1][k] for e in batch], dtype=torch.long)
+            continue
+        if k == "count_soft":
+            batched_data[k] = torch.stack([e[1][k] for e in batch], dim=0)
+            continue
         if k in ["saliency_pos_labels", "saliency_neg_labels"]:
             batched_data[k] = torch.LongTensor([e[1][k] for e in batch])
             continue
@@ -661,6 +677,10 @@ def prepare_batch_inputs(batched_model_inputs, device, non_blocking=False):
         ]
     if "exist_label" in batched_model_inputs:
         targets["exist_label"] = batched_model_inputs["exist_label"].to(device, non_blocking=non_blocking)
+    if "count_label" in batched_model_inputs:
+        targets["count_label"] = batched_model_inputs["count_label"].to(device, non_blocking=non_blocking)
+    if "count_soft" in batched_model_inputs:
+        targets["count_soft"] = batched_model_inputs["count_soft"].to(device, non_blocking=non_blocking)
 
     if "saliency_pos_labels" in batched_model_inputs:
         for name in ["saliency_pos_labels", "saliency_neg_labels"]:

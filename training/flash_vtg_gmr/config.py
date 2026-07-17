@@ -77,6 +77,7 @@ class BaseOptions(object):
         parser.add_argument("--start_epoch", type=int, default=None,
                             help="if None, will be set automatically when using --resume_all")
         parser.add_argument("--resume_adapter",type=str, default=None, help="checkpoint path to resume adapter")
+        parser.add_argument("--train_amc_only", action="store_true", help="Only train the AMC counter module and freeze other parameters")
 
         # Data config
         parser.add_argument("--max_q_l", type=int, default=-1)

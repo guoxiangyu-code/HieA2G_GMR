@@ -29,3 +29,14 @@ Thumbs.db
 # Evaluation outputs
 *_result*.json
 *.out.json
+
+# Exclude Datasets, Results, Checkpoints, and Large PDFs
+data/
+results/
+*.pdf
+checkpoint/
+*.ckpt
+*.pth
+*.zip
+*.tar.gz
+*.tar

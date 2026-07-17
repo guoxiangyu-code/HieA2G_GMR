@@ -303,7 +303,10 @@ def _compute_auroc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     tpr = np.concatenate([[0], tpr[distinct]])
     fpr = np.concatenate([[0], fpr[distinct]])
 
-    return float(np.trapz(tpr, fpr))
+    try:
+        return float(np.trapz(tpr, fpr))
+    except AttributeError:
+        return float(np.trapezoid(tpr, fpr))
 
 
 def get_existence_score(pred: Dict[str, Any]) -> Tuple[float, str]:

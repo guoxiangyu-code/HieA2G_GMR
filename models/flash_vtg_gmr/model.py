@@ -67,6 +67,106 @@ class ConfidenceScorer(nn.Module):
 
         return x
 
+def temporal_distance_matrix(proposals):
+    """
+    proposals: (B, N, 2) - Each proposal is [start, end]
+    Returns temporal distance matrix: (B, N, N), where elements are 1 - tIoU
+    """
+    starts = proposals[:, :, 0] # (B, N)
+    ends = proposals[:, :, 1] # (B, N)
+    
+    s1 = starts.unsqueeze(2) # (B, N, 1)
+    s2 = starts.unsqueeze(1) # (B, 1, N)
+    e1 = ends.unsqueeze(2) # (B, N, 1)
+    e2 = ends.unsqueeze(1) # (B, 1, N)
+    
+    intersection_start = torch.max(s1, s2)
+    intersection_end = torch.min(e1, e2)
+    intersection = (intersection_end - intersection_start).clamp(min=0.0)
+    
+    duration1 = e1 - s1
+    duration2 = e2 - s2
+    union = duration1 + duration2 - intersection
+    
+    tIoU = intersection / (union + 1e-8)
+    return 1.0 - tIoU
+
+class AdaptiveMomentCounter(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        D = hidden_dim
+        
+        # 窗口分数直方图投影 (bin数=10)
+        self.hist_proj = nn.Linear(10, D)
+        
+        # 时序距离矩阵投影 (使用固定插值维度150x150)
+        self.dist_proj = nn.Sequential(
+            nn.Linear(150 * 150, D * 2),
+            nn.LayerNorm(D * 2),
+            nn.GELU(),
+            nn.Linear(D * 2, D)
+        )
+        
+        # 时序精炼: 融合距离矩阵和特征信息
+        self.temporal_refine = nn.Sequential(
+            nn.Linear(D * 4, D),  # text_global + video_global + hist_feat + dist_feat = D * 4
+            nn.LayerNorm(D),
+            nn.GELU()
+        )
+        
+        # 计数分类头
+        self.count_head = nn.Sequential(
+            nn.Linear(D, D),
+            nn.LayerNorm(D),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(D, 5) # {0, 1, 2, 3, 3+}
+        )
+
+    def forward(self, text_feat, text_mask, video_emb, video_msk, window_scores, proposals):
+        """
+        text_feat: (B, L_txt, D)
+        text_mask: (B, L_txt)
+        video_emb: (B, L_vid, D)
+        video_msk: (B, L_vid)
+        window_scores: (B, N)
+        proposals: (B, N, 2)
+        """
+        B, N = window_scores.shape
+        D = text_feat.size(-1)
+        
+        # 1. 窗口分数直方图 (B, 10)
+        hist_list = []
+        for i in range(B):
+            h = torch.histc(window_scores[i], bins=10, min=0.0, max=1.0)
+            hist_list.append(h)
+        hist = torch.stack(hist_list, dim=0).to(window_scores.device)
+        hist = hist / float(N) # Normalize by N
+        hist_feat = self.hist_proj(hist) # (B, D)
+        
+        # 2. 全局特征 (B, D)
+        denom_t = text_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        text_global = (text_feat * text_mask.unsqueeze(-1)).sum(dim=1) / denom_t
+        
+        denom_v = video_msk.sum(dim=1, keepdim=True).clamp(min=1.0)
+        video_global = (video_emb * video_msk.unsqueeze(-1)).sum(dim=1) / denom_v
+        
+        # 3. 时序距离矩阵 (B, N, N)
+        dist = temporal_distance_matrix(proposals)
+        
+        # Resize to fixed (150, 150) shape using bilinear interpolation
+        # dist is (B, N, N) -> (B, 1, N, N)
+        dist_resized = F.interpolate(dist.unsqueeze(1), size=(150, 150), mode="bilinear", align_corners=False).squeeze(1)
+        dist_flat = dist_resized.reshape(B, -1)
+        dist_feat = self.dist_proj(dist_flat) # (B, D)
+        
+        # 4. 计数预测
+        amc_input = torch.cat([text_global, video_global, hist_feat, dist_feat], dim=-1) # (B, 4D)
+        refined = self.temporal_refine(amc_input) # (B, D)
+        count_logits = self.count_head(refined) # (B, 5)
+        
+        return count_logits
+
 class FlashVTG(nn.Module):
     """ FlashVTG. """
 
@@ -134,12 +234,7 @@ class FlashVTG(nn.Module):
         self.use_exist_head = bool(getattr(args, "use_exist_head", False))
         self.exist_pool = str(getattr(args, "exist_pool", "mean"))
         if self.use_exist_head:
-            # Lite head: concat(query_emb, pooled_video_emb) -> logit
-            self.exist_head = nn.Sequential(
-                nn.Linear(hidden_dim * 2, hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, 1),
-            )
+            self.amc_counter = AdaptiveMomentCounter(hidden_dim)
 
 
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, targets=None):
@@ -231,18 +326,28 @@ class FlashVTG(nn.Module):
             output["video_msk"] = video_msk
 
             if self.use_exist_head:
-                vmask = video_msk.float()  # (bsz, L_vid), 1=valid
-                if self.exist_pool == "max":
-                    video_pooled = video_emb.masked_fill(vmask.unsqueeze(-1) == 0, float("-inf")).max(dim=1).values
-                else:
-                    denom = vmask.sum(dim=1, keepdim=True).clamp(min=1.0)
-                    video_pooled = (video_emb * vmask.unsqueeze(-1)).sum(dim=1) / denom
-                query_exist = query_emb.float()
-                if query_exist.ndim == 3:
-                    # pooling adapters may return (B, 1, D); reduce to (B, D) for existence head.
-                    query_exist = query_exist.squeeze(1) if query_exist.shape[1] == 1 else query_exist.mean(dim=1)
-                exist_inp = torch.cat([query_exist, video_pooled.float()], dim=-1)
-                output["pred_exist_logits"] = self.exist_head(exist_inp).squeeze(-1)
+                # 1. Decode proposals vectorized
+                # out_coord: (B, N, 2)
+                # point: (N, 4)
+                decoded_proposals = out_coord.clone()
+                decoded_proposals[:, :, 0] = decoded_proposals[:, :, 0] * -1
+                decoded_proposals = decoded_proposals * point[:, 3, None].repeat(1, 2).unsqueeze(0)
+                decoded_proposals = decoded_proposals + point[:, 0, None].repeat(1, 2).unsqueeze(0)
+                decoded_proposals = decoded_proposals / (1.0 / self.args.clip_length)
+
+                # 2. Get window scores
+                window_scores = out_class.sigmoid().squeeze(-1) # (B, N)
+
+                # 3. amc forward
+                pred_exist_logits = self.amc_counter(
+                    src_txt,
+                    src_txt_mask,
+                    video_emb,
+                    video_msk,
+                    window_scores,
+                    decoded_proposals
+                )
+                output["pred_exist_logits"] = pred_exist_logits # (B, 5)
 
             if self.training == True:
 
@@ -280,7 +385,9 @@ class FlashVTG(nn.Module):
                 output["_out"]["video_msk"] = video_msk
                 output["_out"]["saliency"] = saliency_scores[0]
                 if self.use_exist_head and ("pred_exist_logits" in output):
-                    output["_out"]["pred_exist_score"] = torch.sigmoid(output["pred_exist_logits"]).detach().cpu()
+                    exist_probs = F.softmax(output["pred_exist_logits"], dim=-1)
+                    exist_score = exist_probs[:, 1:].sum(dim=-1)
+                    output["_out"]["pred_exist_score"] = exist_score.detach().cpu()
 
                 if self.coord_head is not None:
                     boundary = out_coord[0]
@@ -379,15 +486,37 @@ class SetCriterion(nn.Module):
         return {"loss_label": losses}
 
     def loss_exist(self, outputs, targets, log=True):
-        if ("exist_label" not in targets) or ("pred_exist_logits" not in outputs):
-            return {"loss_exist": 0.0}
-        logits = outputs["pred_exist_logits"]
-        labels = targets["exist_label"].float()
-        if logits.ndim != 1:
-            logits = logits.view(-1)
-        if labels.ndim != 1:
-            labels = labels.view(-1)
-        return {"loss_exist": F.binary_cross_entropy_with_logits(logits, labels, reduction="mean")}
+        if ("pred_exist_logits" not in outputs) or ("count_label" not in targets):
+            return {"loss_exist": torch.tensor(0.0, device=self.device)}
+        
+        logits = outputs["pred_exist_logits"]  # (B, 5)
+        labels = targets["count_label"]  # (B,)
+        soft_labels = targets["count_soft"]  # (B, 5)
+
+        # 1. Focal Loss (solving class imbalance)
+        # alpha weights: [0.5, 0.7, 0.9, 0.95, 0.97]
+        alpha = torch.tensor([0.5, 0.7, 0.9, 0.95, 0.97], device=logits.device)
+        probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        true_log_probs = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+        true_probs = probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+        alpha_class = alpha[labels]
+        loss_focal = -alpha_class * ((1.0 - true_probs) ** 2.0) * true_log_probs
+        loss_focal = loss_focal.mean()
+
+        # 2. Soft Label Loss
+        loss_soft = -(soft_labels * log_probs).sum(dim=-1).mean()
+
+        # Total AMC loss
+        # Weight config: Focal = 1.0, Soft = 0.3
+        loss_total = loss_focal * 1.0 + loss_soft * 0.3
+
+        return {
+            "loss_exist": loss_total,
+            "loss_exist_focal": loss_focal,
+            "loss_exist_soft": loss_soft
+        }
 
     def loss_saliency(self, outputs, targets, log=True):
         """higher scores for positive clips"""

@@ -59,6 +59,7 @@ def post_processing_mr_nms(mr_res, nms_thd, max_before_nms, max_after_nms, nms_t
 
 
 def eval_epoch_post_processing(submission, opt, gt_data, save_submission_filename):
+    has_eval_v1_3 = False
     # IOU_THDS = (0.5, 0.7)
     logger.info("Saving/Evaluating before nms results")
     submission_path = os.path.join(opt.results_dir, save_submission_filename)
@@ -81,28 +82,34 @@ def eval_epoch_post_processing(submission, opt, gt_data, save_submission_filenam
             eval_gmr_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'eval_GMR', 'v1'))
             if eval_gmr_dir not in sys.path:
                 sys.path.insert(0, eval_gmr_dir)
-            from eval_v1_3 import compute_gmr_cls_metrics, normalize_ground_truth, _load_ts_window_cfg
+            try:
+                from eval_v1_3 import compute_gmr_cls_metrics, normalize_ground_truth, _load_ts_window_cfg
+                has_eval_v1_3 = True
+            except ImportError:
+                has_eval_v1_3 = False
+                logger.warning("Could not import eval_v1_3. Skipping GMR classification metric calculation during validation.")
 
-            gt_raw = load_jsonl(opt.eval_path)
-            ts_cfg = _load_ts_window_cfg(None)
-            gt, _ = normalize_ground_truth(gt_raw, ts_cfg, drop_empty_gt=False)
+            if has_eval_v1_3:
+                gt_raw = load_jsonl(opt.eval_path)
+                ts_cfg = _load_ts_window_cfg(None)
+                gt, _ = normalize_ground_truth(gt_raw, ts_cfg, drop_empty_gt=False)
 
-            pred_qids = set(e["qid"] for e in submission if isinstance(e, dict) and "qid" in e)
-            shared_qids = pred_qids.intersection(set(e["qid"] for e in gt))
-            submission_aligned = [e for e in submission if e.get("qid") in shared_qids]
-            gt_aligned = [e for e in gt if e.get("qid") in shared_qids]
+                pred_qids = set(e["qid"] for e in submission if isinstance(e, dict) and "qid" in e)
+                shared_qids = pred_qids.intersection(set(e["qid"] for e in gt))
+                submission_aligned = [e for e in submission if e.get("qid") in shared_qids]
+                gt_aligned = [e for e in gt if e.get("qid") in shared_qids]
 
-            pred_topk_for_cls = int(getattr(opt, "pred_topk_for_cls", 10))
-            pred_score_thd_for_cls = float(getattr(opt, "pred_score_thd_for_cls", 0.5))
-            cls_metrics = compute_gmr_cls_metrics(
-                submission_aligned,
-                gt_aligned,
-                pred_topk=pred_topk_for_cls,
-                pred_score_thd=pred_score_thd_for_cls,
-            )
-            metrics["brief"]["GMR-TPR"] = cls_metrics["TPR"]
-            metrics["brief"]["GMR-TNR"] = cls_metrics["TNR"]
-            metrics["brief"]["GMR-BalancedAcc"] = cls_metrics["BalancedAcc"]
+                pred_topk_for_cls = int(getattr(opt, "pred_topk_for_cls", 10))
+                pred_score_thd_for_cls = float(getattr(opt, "pred_score_thd_for_cls", 0.5))
+                cls_metrics = compute_gmr_cls_metrics(
+                    submission_aligned,
+                    gt_aligned,
+                    pred_topk=pred_topk_for_cls,
+                    pred_score_thd=pred_score_thd_for_cls,
+                )
+                metrics["brief"]["GMR-TPR"] = cls_metrics["TPR"]
+                metrics["brief"]["GMR-TNR"] = cls_metrics["TNR"]
+                metrics["brief"]["GMR-BalancedAcc"] = cls_metrics["BalancedAcc"]
 
         save_metrics_path = submission_path.replace(".jsonl", "_metrics.json")
         save_json(metrics, save_metrics_path, save_pretty=True, sort_keys=False)
@@ -137,7 +144,7 @@ def eval_epoch_post_processing(submission, opt, gt_data, save_submission_filenam
                 full_only=opt.eval_full_only,
                 mr_only=opt.mr_only,
             )
-            if getattr(opt, "use_exist_head", False):
+            if getattr(opt, "use_exist_head", False) and has_eval_v1_3:
                 submission_after_nms_aligned = [e for e in submission_after_nms if e.get("qid") in shared_qids]
                 pred_topk_for_cls = int(getattr(opt, "pred_topk_for_cls", 10))
                 pred_score_thd_for_cls = float(getattr(opt, "pred_score_thd_for_cls", 0.5))
@@ -311,7 +318,11 @@ def compute_mr_results(
         # Optional existence calibration (GMR): softly suppress window scores for negatives
         pred_exist_scores = None
         if getattr(opt, "use_exist_head", False) and ("pred_exist_logits" in outputs):
-            pred_exist_scores = torch.sigmoid(outputs["pred_exist_logits"]).detach().cpu()
+            logits = outputs["pred_exist_logits"]
+            if logits.ndim == 2 and logits.shape[-1] == 5:
+                pred_exist_scores = F.softmax(logits, dim=-1)[:, 1:].sum(dim=-1).detach().cpu()
+            else:
+                pred_exist_scores = torch.sigmoid(logits).detach().cpu()
             thd = float(getattr(opt, "exist_gate_thd", 0.5))
             mult = torch.where(pred_exist_scores >= thd, torch.ones_like(pred_exist_scores), pred_exist_scores)
 
@@ -369,6 +380,12 @@ def compute_mr_results(
                 cur_query_pred["pred_saliency_scores"] = saliency_scores[idx]
             if pred_exist_scores is not None:
                 cur_query_pred["pred_exist_score"] = float(f"{float(pred_exist_scores[idx]):.3f}")
+            if getattr(opt, "use_exist_head", False) and ("pred_exist_logits" in outputs):
+                logits_list = outputs["pred_exist_logits"][idx].tolist()
+                if isinstance(logits_list, list):
+                    cur_query_pred["pred_exist_logits"] = [float(f"{e:.4f}") for e in logits_list]
+                else:
+                    cur_query_pred["pred_exist_logits"] = float(f"{logits_list:.4f}")
             mr_res.append(cur_query_pred)
 
         loss_dict = {k: v for k, v in outputs.items() if 'loss' in k}
@@ -508,25 +525,46 @@ def setup_model(opt):
         model.to(opt.device)
         criterion.to(opt.device)
 
-    param_dicts = [
-        {
-            "params": [p for n, p in model.named_parameters() if p.requires_grad],
-            "lr": opt.lr,
-        },
-    ]
+    if getattr(opt, "train_amc_only", False):
+        logger.info("Freezing all model weights except amc_counter...")
+        for name, param in model.named_parameters():
+            if "amc_counter" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
+    if getattr(opt, "train_amc_only", False):
+        param_dicts = [
+            {
+                "params": [p for n, p in model.named_parameters() if p.requires_grad],
+                "lr": opt.lr,
+            },
+        ]
+    else:
+        # Differential learning rates: new amc_counter gets opt.lr, frozen/pretrained backbone gets opt.lr * 0.1
+        param_dicts = [
+            {
+                "params": [p for n, p in model.named_parameters() if p.requires_grad and "amc_counter" not in n],
+                "lr": opt.lr * 0.1,
+            },
+            {
+                "params": [p for n, p in model.named_parameters() if p.requires_grad and "amc_counter" in n],
+                "lr": opt.lr,
+            },
+        ]
     optimizer = torch.optim.AdamW(param_dicts, lr=opt.lr, weight_decay=opt.wd)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, opt.lr_drop, gamma=0.5)
     # lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=15, min_lr=1e-4)
 
     if opt.resume_adapter is not None:
         logger.info(f"Load adapter checkpoint from {opt.resume_adapter}")
-        adapter_checkpoint = torch.load(opt.resume_adapter)
+        adapter_checkpoint = torch.load(opt.resume_adapter, weights_only=False)
         adapter_state_dict = {k: v for k, v in adapter_checkpoint['state_dict'].items() if k.startswith('adapter')}
         model.load_state_dict(adapter_state_dict, strict=False)
 
     if opt.resume is not None:
         logger.info(f"Load checkpoint from {opt.resume}")
-        checkpoint = torch.load(opt.resume, map_location="cpu")
+        checkpoint = torch.load(opt.resume, map_location="cpu", weights_only=False)
 
         from collections import OrderedDict
 
@@ -538,9 +576,9 @@ def setup_model(opt):
             for k, v in state.items():
                 name = k[7:] if k.startswith("module.") else k
                 new_state_dict[name] = v
-            model.load_state_dict(new_state_dict, strict=True)
+            model.load_state_dict(new_state_dict, strict=False)
         else:
-            model.load_state_dict(state, strict=True)
+            model.load_state_dict(state, strict=False)
         if opt.resume_all:
             optimizer.load_state_dict(checkpoint["optimizer"])
             lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
