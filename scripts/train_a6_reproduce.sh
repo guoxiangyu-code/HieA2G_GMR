@@ -34,12 +34,12 @@ python -m training.flash_vtg_gmr.train \
   --max_v_l 75 \
   --clip_length 2 \
   --max_windows 5 \
-  --lr 2e-4 \
+  --lr 1e-4 \
   --lr_drop 10 \
   --wd 1e-4 \
-  --n_epoch 15 \
+  --n_epoch 10 \
   --max_es_cnt 15 \
-  --bsz 256 \
+  --bsz 128 \
   --eval_bsz 1 \
   --eval_epoch 1 \
   --device "${DEVICE}" \
@@ -75,4 +75,5 @@ python -m training.flash_vtg_gmr.train \
   --resume /home/guoxiangyu/GMR/generalized-moment-retrieval/Soccer-GMR/checkpoint/flashVTG_gmr \
   --eval_full_only \
   --mr_only \
-  --nms_thd 0.7
+  --nms_thd 0.7 \
+  --train_amc_only True
