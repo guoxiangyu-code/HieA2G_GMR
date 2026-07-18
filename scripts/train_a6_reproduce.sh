@@ -4,8 +4,17 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
+echo "Backing up reproduction scripts..."
+mkdir -p /tmp/gmr_repro_scripts
+cp scripts/reproduce_and_verify_pipeline.sh scripts/train_a6_reproduce.sh scripts/apply_amc_gating_cli.py /tmp/gmr_repro_scripts/
+
 echo "Checking out A6 code commit bd283b2..."
 git checkout bd283b2
+
+echo "Restoring reproduction scripts..."
+mkdir -p scripts
+cp /tmp/gmr_repro_scripts/* scripts/
+
 
 DEVICE="${DEVICE:-1}"
 
