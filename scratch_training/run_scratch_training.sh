@@ -10,8 +10,12 @@ ROOT_DIR="$(cd "${SCRATCH_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
 DEVICE="${DEVICE:-1}"
-EPOCHS="${EPOCHS:-30}"
-BSZ="${BSZ:-128}"
+EPOCHS="${EPOCHS:-400}"
+BSZ="${BSZ:-256}"
+
+# Adjust learning rate decay drop step proportionally to the number of epochs
+# For 400 epochs, decay learning rate at epoch 150 and 300.
+LR_DROP=$((EPOCHS * 37 / 100))
 
 echo "======================================================================"
 # 1. Start Training from Scratch (Random Initialization)
@@ -19,7 +23,7 @@ echo "======================================================================"
 #   - We omit --resume to initialize all parameters (backbone + AMC + HTMA) randomly.
 #   - We do NOT specify --train_amc_only, which allows the entire network to be trained.
 # ==============================================================================
-echo "1. Starting training from scratch (device GPU ${DEVICE}, epochs ${EPOCHS})..."
+echo "1. Starting training from scratch (device GPU ${DEVICE}, epochs ${EPOCHS}, bsz ${BSZ}, lr_drop ${LR_DROP})..."
 python -m training.flash_vtg_gmr.train \
   configs/flash_vtg_gmr/model.py \
   --dset_name hl \
@@ -36,13 +40,13 @@ python -m training.flash_vtg_gmr.train \
   --clip_length 2 \
   --max_windows 5 \
   --lr 1e-4 \
-  --lr_drop 15 \
+  --lr_drop "${LR_DROP}" \
   --wd 1e-4 \
   --n_epoch "${EPOCHS}" \
-  --max_es_cnt 15 \
+  --max_es_cnt 30 \
   --bsz "${BSZ}" \
   --eval_bsz 1 \
-  --eval_epoch 1 \
+  --eval_epoch 2 \
   --device "${DEVICE}" \
   --results_root results/scratch_training \
   --exp_id amc_ft_scratch \

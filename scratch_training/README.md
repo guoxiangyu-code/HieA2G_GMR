@@ -26,13 +26,16 @@ DEVICE=1 bash scratch_training/run_scratch_training.sh
 You can customize the run behavior by specifying environment variables before running:
 
 * **`DEVICE`**: GPU index (default: `1`).
-* **`EPOCHS`**: Number of training epochs (default: `30` to give the random parameters sufficient time to learn temporal grounding features).
-* **`BSZ`**: Training batch size (default: `128`).
+* **`EPOCHS`**: Number of training epochs (default: `400` for thorough convergence from scratch).
+* **`BSZ`**: Training batch size (default: `256`).
 
-Example:
+Example (training on GPU 0 with custom settings):
 ```bash
-DEVICE=0 EPOCHS=40 BSZ=128 bash scratch_training/run_scratch_training.sh
+DEVICE=0 EPOCHS=400 BSZ=256 bash scratch_training/run_scratch_training.sh
 ```
+
+> [!WARNING]
+> Since the backbone network is fully unfrozen and trained from scratch, a batch size of `256` might consume significant GPU memory. If you experience an Out of Memory (OOM) error on your 24GB GPUs (like the RTX 3090), please reduce the batch size by specifying `BSZ=128` or `BSZ=64` before running.
 
 ---
 
