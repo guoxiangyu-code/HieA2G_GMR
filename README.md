@@ -190,6 +190,65 @@ bash scripts/infer_flash_vtg_gmr.sh
 
 See [`models/flash_vtg_gmr/README.md`](models/flash_vtg_gmr/README.md) for setup, required environment variables, and reproduction settings.
 
+## HieA2M (Hierarchical Temporal Moment Alignment)
+
+We provide the implementation and reproduction scripts for HieA2M, which resolves the seven theoretical misalignments in GMR:
+
+### Phase 1: HTMA (A6 Baseline) - 24.90% mAP
+To train the Phase 1 model (with frozen backbone and AMC/HTMA modules) and evaluate it:
+
+```bash
+# Run full reproduction pipeline (Train, Inference, and Gating Evaluation)
+# You can set the DEVICE environment variable (defaults to GPU 1 if not set)
+DEVICE=0 bash scripts/reproduce_and_verify_pipeline.sh
+```
+
+This script will checkout the A6 version, perform training, run test set inference, apply AMC gating, and output the gated metrics in `results/verification_reproduced_a6/gated_metrics.json`.
+
+Alternatively, you can run the steps manually:
+```bash
+# Train the A6 model
+DEVICE=0 bash scripts/train_a6_reproduce.sh
+
+# Run inference
+python -m training.flash_vtg_gmr.inference \
+  configs/flash_vtg_gmr/model.py \
+  --resume results/amc_ft/hl-video_tef-amc_ft_focal_soft-<TIMESTAMP>/model_best.ckpt \
+  --opt_path configs/flash_vtg_gmr/soccer_gmr.json \
+  --eval_split_name test \
+  --eval_path data/label/Standard/test.jsonl \
+  --eval_results_dir results/verification_reproduced_a6 \
+  --v_feat_dirs /home/guoxiangyu/GMR/generalized-moment-retrieval/Soccer-GMR/feature/standard/slowfast /home/guoxiangyu/GMR/generalized-moment-retrieval/Soccer-GMR/feature/standard/clip \
+  --t_feat_dir /home/guoxiangyu/GMR/generalized-moment-retrieval/Soccer-GMR/feature/standard/clip_text \
+  --v_feat_dim 2816 \
+  --t_feat_dim 512 \
+  --device 0 \
+  --nms_thd 0.7
+
+# Apply gating
+python scripts/apply_amc_gating_cli.py \
+  --input_path results/verification_reproduced_a6/hl_test_submission_nms_thd_0.7.jsonl \
+  --output_path results/verification_reproduced_a6/gated_submission.jsonl
+
+# Evaluate gated predictions
+python eval/eval_main.py \
+  --submission_path results/verification_reproduced_a6/gated_submission.jsonl \
+  --gt_path data/label/Standard/test.jsonl \
+  --save_path results/verification_reproduced_a6/gated_metrics.json \
+  --cls_thresholds 0.5 \
+  --gmiou_cls_threshold 0.5
+```
+
+### Phase 2: Consistency Model - 25.15% mAP
+To train the Phase 2 model with Count-Window Consistency Loss (backbone unfrozen, joint fine-tuning):
+
+```bash
+# Train the Consistency model
+DEVICE=0 bash scripts/train_amc_only.sh
+```
+
+This will run training with all weights unfrozen and differential learning rates, applying the consistency loss weight of 0.2. After training, evaluate the model using the same inference, gating, and evaluation commands listed above on the new checkpoint.
+
 ## Citation
 
 If you find this repository useful, please cite our paper:
